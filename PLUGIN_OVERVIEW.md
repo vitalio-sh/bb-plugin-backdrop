@@ -1,8 +1,4 @@
-# Backdrop
-
-Gives every project its own quiet wallpaper, drawn from what the project is about, so you can tell at a glance which project a thread belongs to.
-
-## What it does
+## What you get
 
 - **Reads the project, then draws.** Codex skims the project's README and manifest, picks 3–6 motifs (a restaurant guide gets cups and menus, a pet-portrait shop gets paws and cameras), and generates one seamless black-on-white pattern with its image tool.
 - **One image, both themes.** The pattern is stored as a transparent mask and painted with the theme's text colour, so it shows as dark lines in day mode and light lines in night mode. Day and night opacity are set separately.
