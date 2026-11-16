@@ -19,7 +19,7 @@ import {
   useRpc,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
-import type { Appearance, Background, ProjectState, rpcContract } from "./server";
+import type { Appearance, Background, ProjectState, ProviderStatus, rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
@@ -56,6 +56,24 @@ ${selector}::before {
   -webkit-mask-position: 0 0;
   mask-position: 0 0;
 }`;
+}
+
+/** Plugin-owned glyphs are namespaced by plugin id; a renamed fork keeps working. */
+function useGlyph(): (name: string) => string {
+  const pluginId = experimental_usePluginId();
+  return useCallback((name: string) => `${pluginId}/${name}`, [pluginId]);
+}
+
+type ProviderId = ProviderStatus["id"];
+
+function useProviders() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [state, setState] = useState<{ defaultProvider: ProviderId; providers: ProviderStatus[] } | null>(null);
+  const refetch = useCallback(() => {
+    rpc.call("providers").then(setState, () => undefined);
+  }, [rpc]);
+  useEffect(refetch, [refetch]);
+  return { state, refetch };
 }
 
 function useDarkMode(): boolean {
@@ -192,12 +210,17 @@ function ProjectRow({
   state,
   dark,
   current,
+  provider,
+  providerLabels,
 }: {
   state: ProjectState;
   dark: boolean;
   current: boolean;
+  provider: ProviderId | null;
+  providerLabels: Map<string, string>;
 }) {
   const rpc = useRpc<typeof rpcContract>();
+  const glyph = useGlyph();
   const [hint, setHint] = useState("");
   const [mirror, setMirror] = useState(false);
   const [, tick] = useState(0);
@@ -217,7 +240,13 @@ function ProjectRow({
   };
   const generate = () => {
     rpc
-      .call("generate", { projectId: state.projectId, hint: hint.trim() || undefined, mirror })
+      // bb's RPC client refuses `undefined` values, so leave unset fields out.
+      .call("generate", {
+        projectId: state.projectId,
+        mirror,
+        ...(hint.trim() ? { hint: hint.trim() } : {}),
+        ...(provider ? { provider } : {}),
+      })
       .then(
         ({ started }) => {
           if (!started) toast.message("A generation is already running for this project.");
@@ -232,7 +261,7 @@ function ProjectRow({
         <Preview background={background} dark={dark} className="size-28 shrink-0" />
       ) : (
         <div className="flex size-28 shrink-0 items-center justify-center rounded-md border border-dashed border-border text-muted-foreground">
-          <Icon name="backdrop/image" className="size-5" />
+          <Icon name={glyph("image")} className="size-5" />
         </div>
       )}
       <div className="min-w-0 flex-1 space-y-2">
@@ -250,7 +279,15 @@ function ProjectRow({
           ) : null}
         </div>
         {background?.summary ? (
-          <p className="line-clamp-2 text-xs text-muted-foreground">{background.summary}</p>
+          <p className="line-clamp-2 text-xs text-muted-foreground">
+            {background.summary}
+            {background.provider ? (
+              <span className="text-muted-foreground/70">
+                {" "}
+                · {providerLabels.get(background.provider) ?? background.provider}
+              </span>
+            ) : null}
+          </p>
         ) : null}
 
         {running ? (
@@ -281,7 +318,7 @@ function ProjectRow({
               Force seamless
             </label>
             <Button size="sm" onClick={generate}>
-              <Icon name="backdrop/sparkles" className="size-3.5" />
+              <Icon name={glyph("sparkles")} className="size-3.5" />
               {background ? "Regenerate" : "Generate"}
             </Button>
           </div>
@@ -336,12 +373,12 @@ function ProjectRow({
               ))}
               <span className="flex-1" />
               <Button variant="ghost" size="sm" onClick={() => set({ enabled: !appearance.enabled })}>
-                <Icon name={appearance.enabled ? "backdrop/eye-off" : "backdrop/eye"} className="size-3.5" />
+                <Icon name={glyph(appearance.enabled ? "eye-off" : "eye")} className="size-3.5" />
                 {appearance.enabled ? "Hide" : "Show"}
               </Button>
               <Button variant="ghost" size="sm" asChild>
                 <a href={background.originalUrl} target="_blank" rel="noreferrer">
-                  <Icon name="backdrop/external" className="size-3.5" />
+                  <Icon name={glyph("external")} className="size-3.5" />
                   Original
                 </a>
               </Button>
@@ -370,10 +407,64 @@ function Empty({ children }: { children: ReactNode }) {
   );
 }
 
+function ProviderPicker({
+  providers,
+  value,
+  onChange,
+}: {
+  providers: ProviderStatus[];
+  value: ProviderId;
+  onChange: (id: ProviderId) => void;
+}) {
+  const current = providers.find((p) => p.id === value);
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-border bg-card px-4 py-3 text-sm">
+      <label htmlFor="backdrop-provider" className="text-muted-foreground">
+        Draw new backgrounds with
+      </label>
+      <select
+        id="backdrop-provider"
+        className="h-8 rounded-md border border-border bg-background px-2 text-sm text-foreground"
+        value={value}
+        onChange={(event) => onChange(event.target.value as ProviderId)}
+      >
+        {providers.map((p) => (
+          <option key={p.id} value={p.id}>
+            {p.label}
+            {p.ready ? "" : " (not set up)"}
+          </option>
+        ))}
+      </select>
+      {current ? (
+        <span className={cn("min-w-0 flex-1 truncate text-xs", current.ready ? "text-muted-foreground" : "text-destructive")}>
+          {current.detail}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 function SettingsSection() {
   const { projects, error } = useProjectStates();
   const dark = useDarkMode();
   const { projectId } = useBbContext();
+  const { state: providerState, refetch: refetchProviders } = useProviders();
+  const [picked, setPicked] = useState<ProviderId | null>(null);
+  const provider = picked ?? providerState?.defaultProvider ?? null;
+  const providerLabels = useMemo(
+    () => new Map((providerState?.providers ?? []).map((p) => [p.id as string, p.label])),
+    [providerState],
+  );
+  // Settings saved above this section (API keys, command) change readiness.
+  useEffect(() => {
+    const onFocus = () => refetchProviders();
+    window.addEventListener("focus", onFocus);
+    const timer = setInterval(refetchProviders, 5000);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      clearInterval(timer);
+    };
+  }, [refetchProviders]);
   const sorted = useMemo(
     () =>
       projects
@@ -388,10 +479,13 @@ function SettingsSection() {
   return (
     <div className="space-y-3">
       <p className="text-sm text-muted-foreground">
-        Codex reads each project and draws a seamless monochrome pattern for it. The pattern is stored as a
-        transparent mask and painted behind every thread in that project using the theme's text colour, so it
+        Each project gets a seamless monochrome pattern drawn from its README and manifest. The pattern is stored
+        as a transparent mask and painted behind every thread in that project using the theme's text colour, so it
         works in day and night themes. Agents can do the same with <code>bb backdrop generate</code>.
       </p>
+      {providerState && provider ? (
+        <ProviderPicker providers={providerState.providers} value={provider} onChange={setPicked} />
+      ) : null}
       {error ? (
         <p role="alert" className="text-sm text-destructive">
           {error}
@@ -404,7 +498,14 @@ function SettingsSection() {
       ) : (
         <ul className="divide-y divide-border rounded-lg border border-border bg-card px-4">
           {sorted.map((state) => (
-            <ProjectRow key={state.projectId} state={state} dark={dark} current={state.projectId === projectId} />
+            <ProjectRow
+              key={state.projectId}
+              state={state}
+              dark={dark}
+              current={state.projectId === projectId}
+              provider={provider}
+              providerLabels={providerLabels}
+            />
           ))}
         </ul>
       )}
@@ -416,14 +517,16 @@ function SettingsSection() {
 
 interface MenuData {
   states: Map<string, ProjectState>;
+  glyph: (name: string) => string;
   rpc: ReturnType<typeof useRpc<typeof rpcContract>>;
 }
 
 function useMenuData(): MenuData {
   const { projects, rpc } = useProjectStates();
+  const glyph = useGlyph();
   return useMemo(
-    () => ({ states: new Map((projects ?? []).map((p) => [p.projectId, p])), rpc }),
-    [projects, rpc],
+    () => ({ states: new Map((projects ?? []).map((p) => [p.projectId, p])), rpc, glyph }),
+    [projects, rpc, glyph],
   );
 }
 
@@ -444,26 +547,26 @@ export default definePluginApp((app) => {
     order: 50,
     useData: () => useMenuData(),
     item: ({ thread, data }) => {
-      const { rpc } = data;
+      const { rpc, glyph } = data;
       const state = data.states.get(thread.projectId);
       const background = state?.background ?? null;
       const running = state?.job?.status === "running";
       const items = running
         ? [{ id: "cancel", label: "Cancel generation", icon: "X" }]
         : [
-            { id: "generate", label: background ? "Regenerate from project" : "Generate from project", icon: "backdrop/sparkles" },
+            { id: "generate", label: background ? "Regenerate from project" : "Generate from project", icon: glyph("sparkles") },
             ...(background
               ? [
                   background.appearance.enabled
-                    ? { id: "off", label: "Hide background", icon: "backdrop/eye-off" }
-                    : { id: "on", label: "Show background", icon: "backdrop/eye" },
+                    ? { id: "off", label: "Hide background", icon: glyph("eye-off") }
+                    : { id: "on", label: "Show background", icon: glyph("eye") },
                   { id: "remove", label: "Remove background", icon: "Trash2" },
                 ]
               : []),
           ];
       return {
         label: "Project background",
-        icon: "backdrop/image",
+        icon: glyph("image"),
         detail: running ? "Generating…" : background ? (background.appearance.enabled ? "On" : "Off") : "None",
         choices: { items },
         run: async ({ value }) => {

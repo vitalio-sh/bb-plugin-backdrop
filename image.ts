@@ -3,6 +3,7 @@
 // The output PNG has black RGB everywhere and the pattern's ink as alpha, so
 // the frontend can draw it as a CSS mask tinted with the active theme's
 // foreground colour. One image then works in day and night themes alike.
+import jpeg from "jpeg-js";
 import { PNG } from "pngjs";
 
 export interface MaskOptions {
@@ -30,8 +31,41 @@ export function isPng(bytes: Buffer): boolean {
   );
 }
 
+export function isJpeg(bytes: Buffer): boolean {
+  return bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+}
+
+/** PNG and JPEG are what every supported provider returns. */
+export function isSupportedImage(bytes: Buffer): boolean {
+  return isPng(bytes) || isJpeg(bytes);
+}
+
+interface Rgba {
+  width: number;
+  height: number;
+  data: Uint8Array;
+}
+
+function decode(bytes: Buffer): Rgba {
+  if (isPng(bytes)) return PNG.sync.read(bytes);
+  if (isJpeg(bytes)) {
+    const image = jpeg.decode(bytes, { useTArray: true, formatAsRGBA: true, maxMemoryUsageInMB: 512 });
+    return { width: image.width, height: image.height, data: image.data };
+  }
+  throw new Error("Unsupported image format: expected PNG or JPEG.");
+}
+
+/** Re-encode any supported image as PNG, so stored originals have one format. */
+export function toPng(bytes: Buffer): Buffer {
+  if (isPng(bytes)) return bytes;
+  const image = decode(bytes);
+  const png = new PNG({ width: image.width, height: image.height });
+  png.data = Buffer.from(image.data);
+  return PNG.sync.write(png);
+}
+
 /** Luminance per pixel, compositing any source alpha over white paper. */
-function luminance(src: PNG): Float32Array {
+function luminance(src: Rgba): Float32Array {
   const out = new Float32Array(src.width * src.height);
   const d = src.data;
   for (let i = 0, p = 0; p < out.length; i += 4, p++) {
@@ -122,7 +156,7 @@ function balanceMargins(
 }
 
 export function toInkMask(source: Buffer, options: MaskOptions): MaskResult {
-  const src = PNG.sync.read(source);
+  const src = decode(source);
   let lum = luminance(src);
   if (options.invert) for (let i = 0; i < lum.length; i++) lum[i] = 255 - lum[i]!;
   const balanced = balanceMargins(lum, src.width, src.height);

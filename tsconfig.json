@@ -23,6 +23,7 @@
   "include": [
     "image.ts",
     "codex.ts",
+    "providers.ts",
     "server.ts",
     "app.tsx",
     "components",

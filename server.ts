@@ -1,7 +1,7 @@
 // bb-plugin-backdrop — per-project wallpapers behind every thread.
 //
-// Codex generates a seamless monochrome pattern from the project's own
-// context; image.ts turns it into a transparent ink mask stored in the
+// An image provider (Codex, OpenAI, Gemini, or a custom command) draws a
+// seamless monochrome pattern from the project's own context; image.ts turns it into a transparent ink mask stored in the
 // plugin's SQLite; app.tsx draws it behind the thread pane, tinted with the
 // theme's foreground colour so it works in light and dark mode.
 import { existsSync } from "node:fs";
@@ -9,8 +9,18 @@ import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { generateWithCodex } from "./codex";
-import { isPng, toInkMask } from "./image";
+import { generateWithCodex, resolveCodex } from "./codex";
+import { isSupportedImage, toInkMask, toPng } from "./image";
+import {
+  PROVIDER_IDS,
+  PROVIDER_LABELS,
+  generateWithCommand,
+  generateWithGemini,
+  generateWithOpenAi,
+  readProjectContext,
+  type GeneratedImage,
+  type ProviderId,
+} from "./providers";
 
 const TINTS = ["foreground", "primary", "muted"] as const;
 
@@ -40,6 +50,8 @@ const backgroundSchema = z.object({
   height: z.number(),
   coverage: z.number(),
   createdAt: z.number(),
+  /** Which provider drew it; "" for imports and images from before 0.2. */
+  provider: z.string(),
   imageUrl: z.string(),
   originalUrl: z.string(),
   appearance: appearanceSchema,
@@ -55,6 +67,16 @@ const projectStateSchema = z.object({
 export type ProjectState = z.infer<typeof projectStateSchema>;
 
 const projectIdSchema = z.string().regex(/^proj_[A-Za-z0-9_]+$/);
+const providerIdSchema = z.enum(PROVIDER_IDS);
+
+const providerStatusSchema = z.object({
+  id: providerIdSchema,
+  label: z.string(),
+  ready: z.boolean(),
+  /** Why it is not ready, or what it will use. */
+  detail: z.string(),
+});
+export type ProviderStatus = z.infer<typeof providerStatusSchema>;
 
 export const rpcContract = defineRpcContract({
   /** The background for whatever the current route shows. */
@@ -72,11 +94,16 @@ export const rpcContract = defineRpcContract({
     input: z.null(),
     output: z.object({ projects: z.array(projectStateSchema) }),
   },
+  providers: {
+    input: z.null(),
+    output: z.object({ defaultProvider: providerIdSchema, providers: z.array(providerStatusSchema) }),
+  },
   generate: {
     input: z.object({
       projectId: projectIdSchema,
       hint: z.string().max(2000).optional(),
       mirror: z.boolean().optional(),
+      provider: providerIdSchema.optional(),
     }),
     output: z.object({ started: z.boolean() }),
   },
@@ -111,6 +138,14 @@ const STYLE_RULES = [
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
+    provider: {
+      type: "select",
+      label: "Image provider",
+      description: "Who draws new backgrounds. You can also pick one per generation.",
+      options: [...PROVIDER_IDS],
+      experimental_optionLabels: PROVIDER_LABELS,
+      default: "codex",
+    },
     codexPath: {
       type: "string",
       label: "Codex executable",
@@ -121,6 +156,47 @@ export default async function plugin(bb: BbPluginApi) {
       type: "string",
       label: "Codex model",
       description: "Optional model override for the generation run (blank uses your Codex default).",
+      default: "",
+    },
+    openaiApiKey: {
+      type: "string",
+      label: "OpenAI API key",
+      description: "For the OpenAI provider. Falls back to the OPENAI_API_KEY environment variable.",
+      secret: true,
+    },
+    openaiModel: {
+      type: "string",
+      label: "OpenAI image model",
+      default: "gpt-image-2",
+    },
+    openaiBaseUrl: {
+      type: "string",
+      label: "OpenAI base URL",
+      description: "Change only for an OpenAI-compatible endpoint (Azure, a proxy, a local server).",
+      default: "https://api.openai.com/v1",
+    },
+    geminiApiKey: {
+      type: "string",
+      label: "Gemini API key",
+      description: "For the Gemini provider. Falls back to GEMINI_API_KEY or GOOGLE_API_KEY.",
+      secret: true,
+    },
+    geminiModel: {
+      type: "string",
+      label: "Gemini image model",
+      default: "gemini-3.1-flash-image",
+    },
+    geminiBaseUrl: {
+      type: "string",
+      label: "Gemini base URL",
+      default: "https://generativelanguage.googleapis.com",
+    },
+    imageCommand: {
+      type: "string",
+      label: "Custom image command",
+      description:
+        "For the custom command provider. Runs in /bin/sh in the project folder; read the prompt from $BACKDROP_PROMPT and write a PNG or JPEG to $BACKDROP_OUTPUT.",
+      experimental_multiline: true,
       default: "",
     },
     houseStyle: {
@@ -158,6 +234,7 @@ export default async function plugin(bb: BbPluginApi) {
       coverage REAL NOT NULL,
       created_at INTEGER NOT NULL
     )`,
+    `ALTER TABLE backgrounds ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
   ]);
 
   interface Row {
@@ -169,13 +246,14 @@ export default async function plugin(bb: BbPluginApi) {
     height: number;
     coverage: number;
     created_at: number;
+    provider: string;
   }
   const selectMeta = db.prepare<[string], Row>(
-    `SELECT project_id, version, prompt, summary, width, height, coverage, created_at
+    `SELECT project_id, version, prompt, summary, width, height, coverage, created_at, provider
        FROM backgrounds WHERE project_id = ?`,
   );
   const selectAllMeta = db.prepare<[], Row>(
-    `SELECT project_id, version, prompt, summary, width, height, coverage, created_at FROM backgrounds`,
+    `SELECT project_id, version, prompt, summary, width, height, coverage, created_at, provider FROM backgrounds`,
   );
   const selectMask = db.prepare<[string], { mask: Buffer; version: number }>(
     `SELECT mask, version FROM backgrounds WHERE project_id = ?`,
@@ -184,12 +262,13 @@ export default async function plugin(bb: BbPluginApi) {
     `SELECT original, version FROM backgrounds WHERE project_id = ?`,
   );
   const upsert = db.prepare(
-    `INSERT INTO backgrounds (project_id, version, prompt, summary, original, mask, width, height, coverage, created_at)
-     VALUES (@project_id, @version, @prompt, @summary, @original, @mask, @width, @height, @coverage, @created_at)
+    `INSERT INTO backgrounds (project_id, version, prompt, summary, original, mask, width, height, coverage, created_at, provider)
+     VALUES (@project_id, @version, @prompt, @summary, @original, @mask, @width, @height, @coverage, @created_at, @provider)
      ON CONFLICT(project_id) DO UPDATE SET
        version = excluded.version, prompt = excluded.prompt, summary = excluded.summary,
        original = excluded.original, mask = excluded.mask, width = excluded.width,
-       height = excluded.height, coverage = excluded.coverage, created_at = excluded.created_at`,
+       height = excluded.height, coverage = excluded.coverage, created_at = excluded.created_at,
+       provider = excluded.provider`,
   );
   const deleteRow = db.prepare(`DELETE FROM backgrounds WHERE project_id = ?`);
 
@@ -218,6 +297,7 @@ export default async function plugin(bb: BbPluginApi) {
       height: row.height,
       coverage: row.coverage,
       createdAt: row.created_at,
+      provider: row.provider,
       imageUrl: `${base}/mask?project=${encodeURIComponent(row.project_id)}&v=${v}`,
       originalUrl: `${base}/original?project=${encodeURIComponent(row.project_id)}&v=${v}`,
       appearance: await readAppearance(row.project_id),
@@ -243,19 +323,15 @@ export default async function plugin(bb: BbPluginApi) {
     return failures.get(projectId) ?? null;
   }
 
-  async function readSnippet(path: string, max: number): Promise<string> {
-    try {
-      return (await readFile(path, "utf8")).slice(0, max);
-    } catch {
-      return "";
-    }
+  function styleLines(houseStyle: string, hint: string | undefined): string[] {
+    const lines = STYLE_RULES.map((rule) => `- ${rule}`);
+    if (houseStyle.trim()) lines.push(`- house style: ${houseStyle.trim()}`);
+    if (hint?.trim()) lines.push("", `Direction from the user (takes priority over your own motif choice): ${hint.trim()}`);
+    return lines;
   }
 
-  async function buildPrompt(
-    projectName: string,
-    cwd: string | null,
-    hint: string | undefined,
-  ): Promise<string> {
+  /** Codex is an agent with shell access: it reads the repository itself. */
+  async function buildAgentPrompt(projectName: string, cwd: string | null, hint: string | undefined): Promise<string> {
     const { houseStyle } = await settings.get();
     const lines = [
       `You are designing a subtle wallpaper for the software project "${projectName}".`,
@@ -264,17 +340,29 @@ export default async function plugin(bb: BbPluginApi) {
         : "There is no local checkout; work from the project name and any notes below.",
       "Pick 3-6 simple, recognisable motifs that capture the project's subject or domain (not generic code symbols unless the project is about code).",
       "Then use your image generation tool to create exactly ONE square image with these requirements:",
-      ...STYLE_RULES.map((rule) => `- ${rule}`),
+      ...styleLines(houseStyle, hint),
     ];
-    if (houseStyle.trim()) lines.push(`- house style: ${houseStyle.trim()}`);
-    if (hint?.trim()) lines.push("", `Direction from the user (takes priority over your own motif choice): ${hint.trim()}`);
-    if (!cwd) {
-      lines.push("", "No repository is available; do not run commands.");
-    }
+    if (!cwd) lines.push("", "No repository is available; do not run commands.");
     lines.push(
       "",
       "Do not create, edit or delete any files. When the image is done, reply with one short sentence naming the motifs.",
     );
+    return lines.join("\n");
+  }
+
+  /** Image APIs cannot read files, so the project summary goes into the prompt. */
+  async function buildImagePrompt(projectName: string, cwd: string | null, hint: string | undefined): Promise<string> {
+    const { houseStyle } = await settings.get();
+    const context = await readProjectContext(cwd);
+    const lines = [
+      `A subtle repeating wallpaper pattern for a software project called "${projectName}".`,
+      context
+        ? `What the project is about (from its README and manifest):\n"""\n${context}\n"""`
+        : "Infer the theme from the project name.",
+      "Use 3-6 simple, recognisable motifs that capture the project's subject or domain (not generic code symbols unless the project is about code).",
+      "Requirements:",
+      ...styleLines(houseStyle, hint),
+    ];
     return lines.join("\n");
   }
 
@@ -291,10 +379,99 @@ export default async function plugin(bb: BbPluginApi) {
     return { name: project.name, cwd: local?.path ?? null };
   }
 
+  // ---- providers -----------------------------------------------------------------
+  type Settings = Awaited<ReturnType<typeof settings.get>>;
+  const openAiKey = (values: Settings) => (values.openaiApiKey as string | undefined)?.trim() || process.env.OPENAI_API_KEY || "";
+  const geminiKey = (values: Settings) =>
+    (values.geminiApiKey as string | undefined)?.trim() || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
+
+  async function providerStatuses(): Promise<ProviderStatus[]> {
+    const values = await settings.get();
+    return PROVIDER_IDS.map((id): ProviderStatus => {
+      const label = PROVIDER_LABELS[id];
+      switch (id) {
+        case "codex": {
+          const path = resolveCodex(values.codexPath);
+          const ready = path.includes("/") && existsSync(path);
+          return { id, label, ready, detail: ready ? path : "Codex CLI not found; set the Codex executable path." };
+        }
+        case "openai":
+          return openAiKey(values)
+            ? { id, label, ready: true, detail: values.openaiModel }
+            : { id, label, ready: false, detail: "Add an OpenAI API key in settings or OPENAI_API_KEY." };
+        case "gemini":
+          return geminiKey(values)
+            ? { id, label, ready: true, detail: values.geminiModel }
+            : { id, label, ready: false, detail: "Add a Gemini API key in settings or GEMINI_API_KEY." };
+        case "command":
+          return values.imageCommand.trim()
+            ? { id, label, ready: true, detail: values.imageCommand.trim().split("\n")[0]!.slice(0, 80) }
+            : { id, label, ready: false, detail: "Set the custom image command in settings." };
+      }
+    });
+  }
+
+  async function defaultProvider(): Promise<ProviderId> {
+    const { provider } = await settings.get();
+    return providerIdSchema.safeParse(provider).success ? (provider as ProviderId) : "codex";
+  }
+
+  async function drawImage(
+    provider: ProviderId,
+    project: { name: string; cwd: string | null },
+    hint: string | undefined,
+    signal: AbortSignal,
+    set: (message: string) => void,
+  ): Promise<GeneratedImage> {
+    const values = await settings.get();
+    const timeoutMs = values.timeoutSeconds * 1000;
+    const cwd = project.cwd ?? tmpdir();
+    if (provider === "codex") {
+      set(`Codex is studying ${project.name}…`);
+      const result = await generateWithCodex({
+        codexPath: values.codexPath,
+        model: values.codexModel,
+        cwd,
+        prompt: await buildAgentPrompt(project.name, project.cwd, hint),
+        timeoutMs,
+        signal,
+        onProgress: (line) => set(line),
+      });
+      return { bytes: result.png, summary: result.summary };
+    }
+    const prompt = await buildImagePrompt(project.name, project.cwd, hint);
+    const request = { prompt, cwd, timeoutMs, signal };
+    switch (provider) {
+      case "openai": {
+        const apiKey = openAiKey(values);
+        if (!apiKey) throw new Error("No OpenAI API key. Add one in Backdrop settings or set OPENAI_API_KEY.");
+        set(`OpenAI ${values.openaiModel} is drawing…`);
+        return generateWithOpenAi({ apiKey, model: values.openaiModel, baseUrl: values.openaiBaseUrl }, request);
+      }
+      case "gemini": {
+        const apiKey = geminiKey(values);
+        if (!apiKey) throw new Error("No Gemini API key. Add one in Backdrop settings or set GEMINI_API_KEY.");
+        set(`Gemini ${values.geminiModel} is drawing…`);
+        return generateWithGemini({ apiKey, model: values.geminiModel, baseUrl: values.geminiBaseUrl }, request);
+      }
+      case "command": {
+        if (!values.imageCommand.trim()) throw new Error("Set the custom image command in Backdrop settings first.");
+        set("Running your image command…");
+        return generateWithCommand(values.imageCommand, request);
+      }
+    }
+  }
+
+  function describeSummary(provider: ProviderId, summary: string): string {
+    if (summary.trim()) return summary.trim().slice(0, 500);
+    return `Drawn by ${PROVIDER_LABELS[provider]}.`;
+  }
+
   async function runGeneration(
     projectId: string,
     hint: string | undefined,
     mirror: boolean,
+    provider: ProviderId,
     controller: AbortController,
   ): Promise<void> {
     const set = (message: string) => {
@@ -305,40 +482,31 @@ export default async function plugin(bb: BbPluginApi) {
       }
     };
     try {
-      const { name, cwd } = await projectInfo(projectId);
-      const prompt = await buildPrompt(name, cwd, hint);
-      const { codexPath, codexModel, tileSize, timeoutSeconds } = await settings.get();
-      set(`Codex is studying ${name}…`);
-      const result = await generateWithCodex({
-        codexPath,
-        model: codexModel,
-        cwd: cwd ?? tmpdir(),
-        prompt,
-        timeoutMs: timeoutSeconds * 1000,
-        signal: controller.signal,
-        onProgress: (line) => set(line),
-      });
+      const project = await projectInfo(projectId);
+      const result = await drawImage(provider, project, hint, controller.signal, set);
+      const { tileSize } = await settings.get();
       set("Making the image transparent…");
-      const mask = toInkMask(result.png, { size: tileSize, mirror, invert: false });
+      const mask = toInkMask(result.bytes, { size: tileSize, mirror, invert: false });
       if (mask.coverage < 0.002) throw new Error("The generated image came out blank.");
       const previous = selectMeta.get(projectId);
       upsert.run({
         project_id: projectId,
         version: (previous?.version ?? 0) + 1,
         prompt: hint?.trim() ?? "",
-        summary: result.summary.slice(0, 500),
-        original: result.png,
+        summary: describeSummary(provider, result.summary),
+        original: toPng(result.bytes),
         mask: mask.png,
         width: mask.width,
         height: mask.height,
         coverage: mask.coverage,
         created_at: Date.now(),
+        provider,
       });
       failures.delete(projectId);
-      bb.log.info(`generated background for ${projectId} (${mask.width}x${mask.height})`);
+      bb.log.info(`generated background for ${projectId} with ${provider} (${mask.width}x${mask.height})`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      bb.log.warn(`generation failed for ${projectId}: ${message}`);
+      bb.log.warn(`generation failed for ${projectId} with ${provider}: ${message}`);
       failures.set(projectId, { status: "failed", startedAt: Date.now(), message });
     } finally {
       if (jobs.get(projectId)?.controller === controller) jobs.delete(projectId);
@@ -346,18 +514,25 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
-  function startGeneration(projectId: string, hint?: string, mirror = false): boolean {
+  async function startGeneration(
+    projectId: string,
+    hint?: string,
+    mirror = false,
+    provider?: ProviderId,
+  ): Promise<boolean> {
+    if (jobs.has(projectId)) return false;
+    const chosen = provider ?? (await defaultProvider());
     if (jobs.has(projectId)) return false;
     const controller = new AbortController();
     jobs.set(projectId, {
       status: "running",
       startedAt: Date.now(),
-      message: "Starting Codex…",
+      message: `Starting ${PROVIDER_LABELS[chosen]}…`,
       controller,
     });
     failures.delete(projectId);
     notify(projectId);
-    void runGeneration(projectId, hint, mirror, controller);
+    void runGeneration(projectId, hint, mirror, chosen, controller);
     return true;
   }
 
@@ -434,8 +609,11 @@ export default async function plugin(bb: BbPluginApi) {
     async list() {
       return { projects: await listStates() };
     },
-    generate({ projectId, hint, mirror }) {
-      return { started: startGeneration(projectId, hint, mirror ?? false) };
+    async providers() {
+      return { defaultProvider: await defaultProvider(), providers: await providerStatuses() };
+    },
+    async generate({ projectId, hint, mirror, provider }) {
+      return { started: await startGeneration(projectId, hint, mirror ?? false, provider) };
     },
     cancel({ projectId }) {
       const job = jobs.get(projectId);
@@ -462,7 +640,8 @@ export default async function plugin(bb: BbPluginApi) {
     "Usage:",
     "  bb backdrop list [--json]",
     "  bb backdrop show [--project <id>] [--json]",
-    "  bb backdrop generate [--project <id>] [--hint <text>] [--mirror] [--no-wait] [--json]",
+    "  bb backdrop generate [--project <id>] [--provider codex|openai|gemini|command] [--hint <text>] [--mirror] [--no-wait] [--json]",
+    "  bb backdrop providers [--json]",
     "  bb backdrop import <png-path> [--project <id>] [--invert] [--mirror] [--json]",
     "  bb backdrop set [--project <id>] [--opacity-light N] [--opacity-dark N] [--scale PX] [--tint foreground|primary|muted] [--on|--off]",
     "  bb backdrop remove [--project <id>]",
@@ -483,7 +662,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (eq > 0) {
         flags.set(arg.slice(2, eq), arg.slice(eq + 1));
       } else if (argv[i + 1] !== undefined && !argv[i + 1]!.startsWith("--") &&
-        ["project", "hint", "opacity-light", "opacity-dark", "scale", "tint"].includes(arg.slice(2))) {
+        ["project", "hint", "opacity-light", "opacity-dark", "scale", "tint", "provider"].includes(arg.slice(2))) {
         flags.set(arg.slice(2), argv[++i]!);
       } else {
         flags.set(arg.slice(2), true);
@@ -501,6 +680,7 @@ export default async function plugin(bb: BbPluginApi) {
         `opacity ${a.opacityLight}/${a.opacityDark}`,
         `scale ${a.scale}px`,
         `tint ${a.tint}`,
+        state.background.provider ? `via ${state.background.provider}` : "",
         state.background.summary ? `— ${state.background.summary}` : "",
       );
     } else parts.push("no background");
@@ -509,15 +689,20 @@ export default async function plugin(bb: BbPluginApi) {
   };
 
   bb.cli.register({
-    name: "backdrop",
+    name: bb.pluginId,
     summary: "Generate and manage per-project thread backgrounds",
     commands: [
       { name: "list", summary: "List projects and their backgrounds", usage: "bb backdrop list [--json]" },
       { name: "show", summary: "Show one project's background", usage: "bb backdrop show [--project <id>] [--json]" },
       {
         name: "generate",
-        summary: "Generate a background with Codex from the project's context",
-        usage: "bb backdrop generate [--project <id>] [--hint <text>] [--mirror] [--no-wait] [--json]",
+        summary: "Generate a background from the project's context (Codex, OpenAI, Gemini, or a custom command)",
+        usage: "bb backdrop generate [--project <id>] [--provider codex|openai|gemini|command] [--hint <text>] [--mirror] [--no-wait] [--json]",
+      },
+      {
+        name: "providers",
+        summary: "Show which image providers are ready and which is the default",
+        usage: "bb backdrop providers [--json]",
       },
       {
         name: "import",
@@ -553,6 +738,15 @@ export default async function plugin(bb: BbPluginApi) {
         case undefined:
         case "help":
           return { exitCode: 0, stdout: usage };
+        case "providers": {
+          const [statuses, chosen] = await Promise.all([providerStatuses(), defaultProvider()]);
+          return reply(
+            { defaultProvider: chosen, providers: statuses },
+            statuses
+              .map((p) => `${p.id === chosen ? "*" : " "} ${p.id.padEnd(8)} ${p.ready ? "ready  " : "not set"}  ${p.detail}`)
+              .join("\n"),
+          );
+        }
         case "list": {
           const states = await listStates();
           return reply(
@@ -574,7 +768,14 @@ export default async function plugin(bb: BbPluginApi) {
         }
         case "generate": {
           const hint = typeof flags.get("hint") === "string" ? (flags.get("hint") as string) : undefined;
-          const started = startGeneration(projectId, hint, flags.has("mirror"));
+          const providerFlag = flags.get("provider");
+          let provider: ProviderId | undefined;
+          if (typeof providerFlag === "string") {
+            const parsed = providerIdSchema.safeParse(providerFlag);
+            if (!parsed.success) return fail(`Unknown provider "${providerFlag}". Use one of: ${PROVIDER_IDS.join(", ")}.`);
+            provider = parsed.data;
+          }
+          const started = await startGeneration(projectId, hint, flags.has("mirror"), provider);
           if (flags.has("no-wait")) {
             return reply({ started }, started ? "Generation started." : "A generation is already running.");
           }
@@ -587,7 +788,7 @@ export default async function plugin(bb: BbPluginApi) {
           const path = rest[0];
           if (!path) return fail(usage);
           const bytes = await readFile(path).catch(() => null);
-          if (!bytes || !isPng(bytes)) return fail(`${path} is not a readable PNG.`);
+          if (!bytes || !isSupportedImage(bytes)) return fail(`${path} is not a readable PNG or JPEG.`);
           const { tileSize } = await settings.get();
           const mask = toInkMask(bytes, {
             size: tileSize,
@@ -600,12 +801,13 @@ export default async function plugin(bb: BbPluginApi) {
             version: (previous?.version ?? 0) + 1,
             prompt: "",
             summary: `Imported from ${path}`.slice(0, 500),
-            original: bytes,
+            original: toPng(bytes),
             mask: mask.png,
             width: mask.width,
             height: mask.height,
             coverage: mask.coverage,
             created_at: Date.now(),
+            provider: "",
           });
           notify(projectId);
           const state = { projectId, background: await getBackground(projectId), job: null };
